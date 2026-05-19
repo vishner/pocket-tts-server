@@ -96,14 +96,36 @@ config = load_config()
 # Initialize TTS Model
 tts_model = None
 voice_states = {}  # Cache voice states
+voice_cloning_available = False
+
+VOICE_CLONING_SETUP_MSG = (
+    "Custom voice cloning requires Hugging Face access. "
+    "1) Accept the model license at https://huggingface.co/kyutai/pocket-tts "
+    "2) Log in locally: uvx hf auth login "
+    "3) Restart this server (run_pocket_tts.bat)."
+)
 
 if POCKET_TTS_AVAILABLE:
     try:
+        from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
+    except ImportError:
+        _ORIGINS_OF_PREDEFINED_VOICES = {}
+
+    try:
         print("[INFO] Loading TTS model...")
         tts_model = TTSModel.load_model()
+        voice_cloning_available = tts_model.has_voice_cloning
         print(
             f"[INFO] TTS model loaded successfully (sample rate: {tts_model.sample_rate}Hz)"
         )
+        if voice_cloning_available:
+            print("[INFO] Voice cloning: enabled (custom WAV voices supported)")
+        else:
+            print("[WARNING] Voice cloning: DISABLED — custom uploaded voices will not work")
+            print(f"[WARNING] {VOICE_CLONING_SETUP_MSG}")
+            print(
+                "[INFO] Built-in catalog voices still work (e.g. alba, cosette, marius)"
+            )
     except Exception as e:
         print(f"[WARNING] Failed to load TTS model: {e}")
         import traceback
@@ -112,6 +134,7 @@ if POCKET_TTS_AVAILABLE:
         tts_model = None
 else:
     print("[INFO] TTS not available - voice generation disabled")
+    _ORIGINS_OF_PREDEFINED_VOICES = {}
 
 # Voice cache
 available_voices = {}
@@ -163,18 +186,36 @@ def scan_voices():
 
 
 def get_voice_state(voice_id):
-    """Get or load voice state on-demand"""
+    """Get or load voice state on-demand (catalog or custom WAV)."""
     if voice_id in voice_states:
         return voice_states[voice_id]
 
-    if voice_id in available_voices and tts_model:
+    if not tts_model:
+        return None
+
+    # Built-in catalog voice (no cloning weights required)
+    if voice_id in _ORIGINS_OF_PREDEFINED_VOICES:
+        try:
+            print(f"[INFO] Loading catalog voice: {voice_id}")
+            voice_states[voice_id] = tts_model.get_state_for_audio_prompt(voice_id)
+            return voice_states[voice_id]
+        except Exception as e:
+            print(f"[WARNING] Failed to load catalog voice {voice_id}: {e}")
+            return None
+
+    # Custom voice from local WAV
+    if voice_id in available_voices:
+        if not voice_cloning_available:
+            print(
+                f"[WARNING] Cannot load custom voice '{voice_id}' — cloning model not available"
+            )
+            print(f"[WARNING] {VOICE_CLONING_SETUP_MSG}")
+            return None
+
         voice_file = available_voices[voice_id]["file"]
         try:
             print(f"[INFO] Loading voice state for: {voice_id}")
-
-            # Convert to WAV if needed (for MP3/OGG/FLAC)
             wav_file = convert_to_wav(voice_file)
-
             voice_states[voice_id] = tts_model.get_state_for_audio_prompt(wav_file)
             print(f"[INFO] Voice state loaded for: {voice_id}")
             return voice_states[voice_id]
@@ -356,27 +397,16 @@ async def create_speech(request: OpenAITTSRequest):
         )
 
     try:
-        # Get voice state
-        voice_state = None
-        if request.voice in voice_states:
-            voice_state = voice_states[request.voice]
-        elif request.voice in available_voices:
-            # Load voice state on demand
-            voice_file = available_voices[request.voice]["file"]
-            try:
-                voice_state = tts_model.get_state_for_audio_prompt(voice_file)
-                voice_states[request.voice] = voice_state
-            except Exception as e:
-                print(f"[WARNING] Failed to load voice state: {e}")
+        voice_state = get_voice_state(request.voice)
 
         if not voice_state:
-            # Use default voice if available
-            if "default" in voice_states:
-                voice_state = voice_states["default"]
-            else:
+            if request.voice in available_voices and not voice_cloning_available:
                 raise HTTPException(
-                    status_code=400, detail=f"Voice '{request.voice}' not found"
+                    status_code=503, detail=VOICE_CLONING_SETUP_MSG
                 )
+            raise HTTPException(
+                status_code=400, detail=f"Voice '{request.voice}' not found"
+            )
 
         # Generate audio
         audio = tts_model.generate_audio(voice_state, request.input)
@@ -433,9 +463,27 @@ async def list_voices():
                 "name": voice_info.get("name", voice_id),
                 "preview_url": voice_info.get("preview", ""),
                 "type": voice_info.get("type", "custom"),
+                "requires_cloning": True,
+                "available": voice_cloning_available,
             }
         )
-    return {"voices": voices}
+    if tts_model and _ORIGINS_OF_PREDEFINED_VOICES:
+        for catalog_id in sorted(_ORIGINS_OF_PREDEFINED_VOICES):
+            if catalog_id not in available_voices:
+                voices.append(
+                    {
+                        "voice_id": catalog_id,
+                        "name": catalog_id.replace("_", " ").title(),
+                        "preview_url": "",
+                        "type": "catalog",
+                        "requires_cloning": False,
+                        "available": True,
+                    }
+                )
+    return {
+        "voices": voices,
+        "voice_cloning_available": voice_cloning_available,
+    }
 
 
 # ============== LLM Integration ==============
@@ -677,20 +725,16 @@ async def stream_chat_response(request: VoiceChatRequest):
     try:
         print(f"[INFO] Starting TRUE stream_chat_response with voice: {request.voice}")
 
-        # Get voice state (load once at start)
         voice_state = None
         if tts_model:
             print(f"[INFO] Getting voice state for: {request.voice}")
-            if request.voice in voice_states:
-                voice_state = voice_states[request.voice]
-            elif request.voice in available_voices:
-                voice_file = available_voices[request.voice]["file"]
-                try:
-                    voice_state = tts_model.get_state_for_audio_prompt(voice_file)
-                    voice_states[request.voice] = voice_state
-                    print(f"[INFO] Voice state loaded")
-                except Exception as e:
-                    print(f"[WARNING] Failed to load voice state: {e}")
+            voice_state = get_voice_state(request.voice)
+            if not voice_state:
+                if request.voice in available_voices and not voice_cloning_available:
+                    err_msg = VOICE_CLONING_SETUP_MSG
+                else:
+                    err_msg = f"Voice '{request.voice}' not found"
+                yield f"data: {json.dumps({'type': 'error', 'message': err_msg})}\n\n"
 
         # Buffers
         sentence_buffer = ""
@@ -809,16 +853,7 @@ async def chat_completions(request: VoiceChatRequest):
         # Generate TTS for the response
         audio_data = None
         if tts_model:
-            voice_state = None
-            if request.voice in voice_states:
-                voice_state = voice_states[request.voice]
-            elif request.voice in available_voices:
-                voice_file = available_voices[request.voice]["file"]
-                try:
-                    voice_state = tts_model.get_state_for_audio_prompt(voice_file)
-                    voice_states[request.voice] = voice_state
-                except Exception as e:
-                    print(f"[WARNING] Failed to load voice state: {e}")
+            voice_state = get_voice_state(request.voice)
 
             if voice_state:
                 try:
@@ -930,7 +965,12 @@ async def health_check():
     return {
         "status": "healthy",
         "tts_available": tts_model is not None,
+        "voice_cloning_available": voice_cloning_available,
+        "custom_voices": len(available_voices),
         "voices_loaded": len(available_voices),
+        "voice_cloning_setup": None
+        if voice_cloning_available
+        else VOICE_CLONING_SETUP_MSG,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -1075,7 +1115,8 @@ if __name__ == "__main__":
 ║    POST /v1/chat/completions    - Voice Chat with LLM       ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  TTS Available: {"Yes" if tts_model else "No - Install: pip install pocket-tts":<42}║
-║  Voices Loaded: {len(available_voices):<42}║
+║  Voice Cloning: {"Yes" if voice_cloning_available else "No - run setup_huggingface.bat":<42}║
+║  Custom Voices: {len(available_voices):<42}║
 ╚══════════════════════════════════════════════════════════════╝
     """)
 
